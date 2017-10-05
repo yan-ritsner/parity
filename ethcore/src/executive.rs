@@ -416,7 +416,7 @@ impl<'a, B: 'a + StateBackend> Executive<'a, B> {
 
 			let cost = builtin.cost(data);
 			if cost <= params.gas {
-				let mut builtin_out_buffer = Vec::new();
+				let mut builtin_out_buffer = Vec::with_capacity(output.len());
 				let result = {
 					let mut builtin_output = BytesRef::Flexible(&mut builtin_out_buffer);
 					builtin.execute(data, &mut builtin_output)
