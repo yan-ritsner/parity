@@ -23,12 +23,12 @@ use parking_lot::Mutex;
 
 use ethcore::account_provider::AccountProvider;
 
-use futures::{future, BoxFuture, Future};
+use futures::{future, BoxFuture, Future, Async};
 use jsonrpc_core::Error;
 use v1::helpers::{
 	errors, oneshot,
 	DefaultAccount,
-	SIGNING_QUEUE_LIMIT, SigningQueue, ConfirmationPromise, ConfirmationResult, SignerService,
+	SIGNING_QUEUE_LIMIT, SigningQueue, ConfirmationReceiver, ConfirmationResult, SignerService,
 };
 use v1::helpers::dispatch::{self, Dispatcher};
 use v1::helpers::accounts::unwrap_provider;
@@ -50,7 +50,7 @@ const MAX_PENDING_DURATION_SEC: u32 = 60;
 const MAX_TOTAL_REQUESTS: usize = SIGNING_QUEUE_LIMIT;
 
 enum DispatchResult {
-	Promise(ConfirmationPromise),
+	Future(ConfirmationReceiver),
 	Value(RpcConfirmationResponse),
 }
 
@@ -59,7 +59,7 @@ pub struct SigningQueueClient<D> {
 	signer: Arc<SignerService>,
 	accounts: Option<Arc<AccountProvider>>,
 	dispatcher: D,
-	pending: Arc<Mutex<TransientHashMap<U256, ConfirmationPromise>>>,
+	pending: Arc<Mutex<TransientHashMap<U256, ConfirmationReceiver>>>,
 }
 
 fn handle_dispatch<OnResponse>(res: Result<DispatchResult, Error>, on_response: OnResponse)
@@ -67,22 +67,27 @@ fn handle_dispatch<OnResponse>(res: Result<DispatchResult, Error>, on_response: 
 {
 	match res {
 		Ok(DispatchResult::Value(result)) => on_response(Ok(result)),
-		Ok(DispatchResult::Promise(promise)) => {
-			promise.wait_for_result(move |result| {
-				on_response(result.unwrap_or_else(|| Err(errors::request_rejected())))
-			})
-		},
+		Ok(DispatchResult::Future(ref future)) => {
+			future.receiver().and_then(move |result| {
+				let result = match result.clone() {
+					ConfirmationResult::Confirmed(rpc_result) => rpc_result,
+					ConfirmationResult::Rejected => Err(errors::request_rejected())
+				};
+				on_response(result);
+				future::ok(())
+			}).wait().unwrap_or_else(|err| debug!("Waiting for the confirmation message failed: {:?}", err));
+		}
 		Err(e) => on_response(Err(e)),
 	}
 }
 
-fn collect_garbage(map: &mut TransientHashMap<U256, ConfirmationPromise>) {
+fn collect_garbage(map: &mut TransientHashMap<U256, ConfirmationReceiver>) {
 	map.prune();
 	if map.len() > MAX_TOTAL_REQUESTS {
 		// Remove all non-waiting entries.
 		let non_waiting: Vec<_> = map
 			.iter()
-			.filter(|&(_, val)| val.result() != ConfirmationResult::Waiting)
+			.filter(|&(_, val)| val.receiver().poll().map(|async| async.is_ready()).unwrap_or(true))
 			.map(|(key, _)| *key)
 			.collect();
 		for k in non_waiting {
@@ -126,7 +131,7 @@ impl<D: Dispatcher + 'static> SigningQueueClient<D> {
 				} else {
 					future::done(
 						signer.add_request(payload, origin)
-							.map(DispatchResult::Promise)
+							.map(DispatchResult::Future)
 							.map_err(|_| errors::request_rejected_limit())
 					).boxed()
 				}
@@ -152,11 +157,11 @@ impl<D: Dispatcher + 'static> ParitySigning for SigningQueueClient<D> {
 			meta.origin
 		).map(move |result| match result {
 			DispatchResult::Value(v) => RpcEither::Or(v),
-			DispatchResult::Promise(promise) => {
-				let id = promise.id();
+			DispatchResult::Future(future) => {
+				let id = future.id();
 				let mut pending = pending.lock();
 				collect_garbage(&mut pending);
-				pending.insert(id, promise);
+				pending.insert(id, future);
 
 				RpcEither::Either(id.into())
 			},
@@ -169,11 +174,11 @@ impl<D: Dispatcher + 'static> ParitySigning for SigningQueueClient<D> {
 		self.dispatch(RpcConfirmationPayload::SendTransaction(request), meta.dapp_id().into(), meta.origin)
 			.map(move |result| match result {
 				DispatchResult::Value(v) => RpcEither::Or(v),
-				DispatchResult::Promise(promise) => {
-					let id = promise.id();
+				DispatchResult::Future(future) => {
+					let id = future.id();
 					let mut pending = pending.lock();
 					collect_garbage(&mut pending);
-					pending.insert(id, promise);
+					pending.insert(id, future);
 
 					RpcEither::Either(id.into())
 				},
@@ -184,10 +189,15 @@ impl<D: Dispatcher + 'static> ParitySigning for SigningQueueClient<D> {
 	fn check_request(&self, id: RpcU256) -> Result<Option<RpcConfirmationResponse>, Error> {
 		let id: U256 = id.into();
 		match self.pending.lock().get(&id) {
-			Some(ref promise) => match promise.result() {
-				ConfirmationResult::Waiting => Ok(None),
-				ConfirmationResult::Rejected => Err(errors::request_rejected()),
-				ConfirmationResult::Confirmed(rpc_response) => rpc_response.map(Some),
+			Some(ref future) => match future.receiver().poll() {
+				Ok(Async::NotReady) => Ok(None),
+				Ok(Async::Ready(status)) => { 
+					match status.clone() {
+						ConfirmationResult::Rejected => Err(errors::request_rejected()),
+						ConfirmationResult::Confirmed(rpc_response) => rpc_response.map(Some),
+					}
+				},
+				Err(error) => Err(error.clone())
 			},
 			_ => Err(errors::request_not_found()),
 		}
